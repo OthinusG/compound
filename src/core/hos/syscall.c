@@ -43,9 +43,11 @@ static error_t svc_set_thread_priority(hos_syscall_context_t *context, guest_sta
 static error_t svc_get_current_processor_number(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_signal_event(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_clear_event(hos_syscall_context_t *context, guest_state_t *state);
+static error_t svc_create_event(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_close_handle(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_reset_signal(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_wait_synchronization(hos_syscall_context_t *context, guest_state_t *state);
+static error_t svc_cancel_synchronization(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_get_system_tick(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_connect_to_named_port(hos_syscall_context_t *context, guest_state_t *state);
 static error_t svc_get_thread_id(hos_syscall_context_t *context, guest_state_t *state);
@@ -78,6 +80,7 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { HOS_SVC_CLOSE_HANDLE, "svcCloseHandle", svc_close_handle },
     { HOS_SVC_RESET_SIGNAL, "svcResetSignal", svc_reset_signal },
     { HOS_SVC_WAIT_SYNCHRONIZATION, "svcWaitSynchronization", svc_wait_synchronization },
+    { HOS_SVC_CANCEL_SYNCHRONIZATION, "svcCancelSynchronization", svc_cancel_synchronization },
     { HOS_SVC_GET_SYSTEM_TICK, "svcGetSystemTick", svc_get_system_tick },
     { HOS_SVC_CONNECT_TO_NAMED_PORT, "svcConnectToNamedPort", svc_connect_to_named_port },
     { HOS_SVC_GET_THREAD_ID, "svcGetThreadId", svc_get_thread_id },
@@ -85,6 +88,7 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { HOS_SVC_OUTPUT_DEBUG_STRING, "svcOutputDebugString", svc_output_debug_string },
     { HOS_SVC_FLUSH_ENTIRE_DATA_CACHE, "svcFlushEntireDataCache", svc_flush_entire_data_cache },
     { HOS_SVC_FLUSH_DATA_CACHE, "svcFlushDataCache", svc_flush_data_cache },
+    { HOS_SVC_CREATE_EVENT, "svcCreateEvent", svc_create_event },
     { HOS_SVC_SLEEP_SYSTEM, "svcSleepSystem", svc_sleep_system },
 
     // Known, named, and deliberately not implemented. Each of these is waiting on a
@@ -94,7 +98,6 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { 0x13U, "svcMapSharedMemory", NULL },
     { 0x14U, "svcUnmapSharedMemory", NULL },
     { 0x15U, "svcCreateTransferMemory", NULL },
-    { 0x19U, "svcCancelSynchronization", NULL },
     { 0x20U, "svcSendSyncRequestLight", NULL },
     { 0x21U, "svcSendSyncRequest", NULL },
     { 0x22U, "svcSendSyncRequestWithUserBuffer", NULL },
@@ -104,7 +107,6 @@ static const hos_syscall_entry_t HOS_SYSCALLS[] = {
     { 0x42U, "svcReplyAndReceiveLight", NULL },
     { 0x43U, "svcReplyAndReceive", NULL },
     { 0x44U, "svcReplyAndReceiveWithUserBuffer", NULL },
-    { 0x45U, "svcCreateEvent", NULL },
     { 0x50U, "svcCreateSharedMemory", NULL },
     { 0x70U, "svcCreatePort", NULL },
     { 0x71U, "svcManageNamedPort", NULL },
@@ -639,6 +641,12 @@ handle_failure_result(error_t error, uint32_t *POUND_RESTRICT out_result)
         return true;
     }
 
+    if (error == POUND_ERROR_INVALID_STATE)
+    {
+        *out_result = HOS_RESULT_INVALID_STATE;
+        return true;
+    }
+
     return false;
 }
 
@@ -680,9 +688,41 @@ svc_clear_event(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *PO
         return error;
     }
 
-    // Clearing an event that is not signaled is a success: `svcClearEvent` is allowed to
-    // be redundant, which is what makes it usable as "make sure this is clear".
     state->x[0] = HOS_RESULT_SUCCESS;
+    return POUND_SUCCESS;
+}
+
+static error_t
+svc_create_event(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
+{
+    // Horizon's signature takes no arguments: the kernel answers with two handles in
+    // registers, `W1` writable and `W2` readable. libnx's stub saves the caller's two
+    // out-pointers before the trap and stores those registers through them afterwards, so
+    // a handler that wrote through `X0` instead would leave a real guest with stale
+    // handle values.
+    hos_handle_t writable = HOS_HANDLE_INVALID;
+    hos_handle_t readable = HOS_HANDLE_INVALID;
+
+    const error_t error =
+        hos_process_create_event_pair(context->process, false, &writable, &readable);
+
+    if (error == POUND_ERROR_ALLOCATION_FAILED)
+    {
+        // Pound's object and handle tables are its event quota, and running out of slots
+        // is exactly what Horizon reports as `0xCE01` for this call. Refusing with an
+        // emulator error would wedge a guest that Horizon would have let run.
+        state->x[0] = HOS_RESULT_SLAB_EXHAUSTED;
+        return POUND_SUCCESS;
+    }
+
+    if (error != POUND_SUCCESS)
+    {
+        return error;
+    }
+
+    state->x[0] = HOS_RESULT_SUCCESS;
+    state->x[1] = writable;
+    state->x[2] = readable;
     return POUND_SUCCESS;
 }
 
@@ -710,38 +750,21 @@ svc_close_handle(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *P
 static error_t
 svc_reset_signal(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
 {
-    const hos_handle_t handle = handle_argument(state->x[0]);
-    bool               signaled = false;
-
     uint32_t      result = HOS_RESULT_SUCCESS;
-    error_t       error  = hos_process_event_is_signaled(context->process, handle, &signaled);
+    const error_t error =
+        hos_process_event_reset(context->process, handle_argument(state->x[0]));
 
     if (handle_failure_result(error, &result))
     {
+        // `0xFA01` for an event that was already clear is the point of the call: it is
+        // how a guest tells "I consumed the signal" from "something else got there
+        // first", so it is a completed call with a `Result`, not an emulator error.
         state->x[0] = result;
         return POUND_SUCCESS;
     }
 
     if (error != POUND_SUCCESS)
     {
-        return error;
-    }
-
-    if (!signaled)
-    {
-        // Not a no-op, and deliberately so: this is how a guest distinguishes having
-        // consumed a signal from something else having got there first. Reporting
-        // success for an event that was already clear would erase that distinction.
-        state->x[0] = HOS_RESULT_INVALID_STATE;
-        return POUND_SUCCESS;
-    }
-
-    error = hos_process_event_clear(context->process, handle);
-
-    if (error != POUND_SUCCESS)
-    {
-        // Unreachable: the handle was resolved and typed one call ago, and nothing has
-        // run in between because the kernel lock is released and retaken per call.
         return error;
     }
 
@@ -752,6 +775,24 @@ svc_reset_signal(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *P
 static error_t
 svc_wait_synchronization(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
 {
+    // A cancellation requested while this thread was not in a synchronization call is
+    // waiting for this one. Horizon answers it before the wait looks at its handles -- the
+    // flag means "the next synchronization call is interrupted" -- so a cancelled poll
+    // reports no index even when a handle was already ready, and an auto-reset event is not
+    // consumed by a call that never got as far as polling.
+    if (context->scheduler != NULL)
+    {
+        const uint64_t current_id = hos_scheduler_current_thread_id(context->scheduler);
+        bool           cancelled  = false;
+
+        if ((hos_kernel_thread_take_cancel(context->kernel, current_id, &cancelled) == POUND_SUCCESS) &&
+            cancelled)
+        {
+            state->x[0] = HOS_RESULT_INTERRUPTED;
+            return POUND_SUCCESS;
+        }
+    }
+
     // Horizon's signature: X0 is a pointer to the ready index, X1 the handle array, W2 the
     // count and X3 the timeout. X0 is a pointer on entry and the `Result` on return, which
     // is why the index is written *through* it before it is replaced.
@@ -871,6 +912,59 @@ svc_wait_synchronization(hos_syscall_context_t *POUND_RESTRICT context, guest_st
     // still in `X0`, because `hos_syscall_complete_block` needs it when the scheduler
     // wakes the thread.
     context->outcome = HOS_SYSCALL_BLOCKED;
+    return POUND_SUCCESS;
+}
+
+static error_t
+svc_cancel_synchronization(hos_syscall_context_t *POUND_RESTRICT context, guest_state_t *POUND_RESTRICT state)
+{
+    // Horizon's signature: W0 is a `Handle<Thread>` and the answer is a `Result` in W0.
+    // Success covers both ways the request can land -- a parked wait is interrupted now, or
+    // a flag is armed for the next one -- so the only guest-visible failure is the handle.
+    uint32_t result = HOS_RESULT_SUCCESS;
+    uint64_t id     = 0U;
+
+    error_t error = hos_process_thread_id(context->process, handle_argument(state->x[0]), &id);
+
+    if (handle_failure_result(error, &result))
+    {
+        state->x[0] = result;
+        return POUND_SUCCESS;
+    }
+
+    if (error != POUND_SUCCESS)
+    {
+        return error;
+    }
+
+    // The refusal is about the *context*, not the request: without a run queue Pound cannot
+    // name the thread that is calling, so a flag set here could never be consumed by a wait
+    // and answering success would promise an interruption that cannot happen. The handle was
+    // still resolved first, because Horizon's `0xE401` is the same on every machine.
+    if (context->scheduler == NULL)
+    {
+        POUND_LOG_ERROR(&thread_logger,
+                        "Refusing svcCancelSynchronization: cancelling a wait needs a scheduler to find "
+                        "the thread, and a context without one cannot consume the request.");
+        return POUND_ERROR_UNSUPPORTED_SYSCALL;
+    }
+
+    // A thread that is parked on handles is ended here, by the layer that owns the park.
+    // Anything else -- the caller itself, a sleeper, a runnable thread, one never admitted
+    // -- gets the durable flag instead, which its next synchronization call consumes.
+    if (!hos_scheduler_cancel(context->scheduler, id))
+    {
+        error = hos_kernel_thread_request_cancel(context->kernel, id);
+
+        if (error != POUND_SUCCESS)
+        {
+            // Unreachable from here: `hos_process_thread_id` resolved the handle a moment
+            // ago, and the thread's own reference keeps the object alive while it can run.
+            return error;
+        }
+    }
+
+    state->x[0] = HOS_RESULT_SUCCESS;
     return POUND_SUCCESS;
 }
 
@@ -1576,6 +1670,13 @@ hos_syscall_complete_block(hos_syscall_context_t *POUND_RESTRICT context,
             // pointer is not written at all -- which is also what keeps a stale index from
             // pointing the guest at a handle it never asked about.
             state->x[0] = HOS_RESULT_TIMEOUT;
+            break;
+
+        case HOS_WAKE_CANCELLED:
+            // Another thread cancelled the wait. Like a timeout, it stopped without anything
+            // becoming ready, so the index pointer is left alone and `W1` keeps whatever the
+            // parked call left there. Horizon's `0xEC01` is the whole answer.
+            state->x[0] = HOS_RESULT_INTERRUPTED;
             break;
 
         case HOS_WAKE_SLEPT:

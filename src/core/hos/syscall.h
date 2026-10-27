@@ -65,6 +65,20 @@
 //! A call that returns nothing at all (`svcExitThread`, `svcSleepThread`,
 //! `svcFlushEntireDataCache`) must leave `X0` exactly as the guest left it.
 //!
+//! # Events and the two sides of a handle
+//!
+//! `svcCreateEvent` takes no arguments and answers two handles in registers: `W1`
+//! is the writable side and `W2` the readable one. The two name one manual-reset
+//! event. Horizon's event handles are one-directional -- `svcSignalEvent` needs the
+//! writable side, a wait and `svcResetSignal` need the readable one, and
+//! `svcClearEvent` accepts either -- and the wrong side is `0xE401`, the same
+//! `Result` as a handle that names nothing. Pound models that as a right on the
+//! handle rather than on the object, so `svcDuplicateHandle` cannot promote a
+//! readable handle into a writable one. The event itself is manual-reset and not
+//! auto-reset: libnx implements its autoclear mode by calling `svcResetSignal`
+//! after a successful wait, so a kernel that consumed the signal in the wait would
+//! make every autoclear wait return `0xFA01`.
+//!
 //! # Blocking
 //!
 //! `svcWaitSynchronization` and `svcSleepThread` can suspend the calling thread,
@@ -79,13 +93,24 @@
 //! *why*, and the run loop -- the same piece of code that has the thread's register
 //! file in hand -- calls `hos_syscall_complete_block`, which finishes the call:
 //! writes the ready index through the pointer for a signal, puts `0xEA01` in `X0`
-//! for a timeout, and does nothing to `X0` for a plain sleep. Then, and only then,
-//! does `pc` step past the `SVC`.
+//! for a timeout, `0xEC01` for a cancellation, and does nothing to `X0` for a plain
+//! sleep. Then, and only then, does `pc` step past the `SVC`.
+//!
+//! `svcCancelSynchronization` is the other way such a wait ends, and it has two
+//! shapes because Horizon does. A thread already parked is interrupted by a
+//! `HOS_WAKE_CANCELLED` wake, so that call answers `0xEC01` when it resumes. A thread
+//! that is not in a synchronization call has a flag set on its kernel object instead,
+//! and its *next* wait consumes that flag and answers `0xEC01` before it looks at its
+//! handles. Cancellation is therefore not a timeout and not a signal: the wait gets a
+//! `Result` that says somebody else stopped it.
 //!
 //! This only exists with a scheduler. A context that was never given one has no
 //! clock and no run queue, so a call that would block is refused with
 //! `POUND_ERROR_UNSUPPORTED_SYSCALL` and a log line: the same shape as any other
-//! unimplemented feature, and for the same reason.
+//! unimplemented feature, and for the same reason. `svcCancelSynchronization` is
+//! refused without one too, even though setting the flag needs no clock: without a
+//! run queue Pound cannot name the calling thread, so the flag it would set could
+//! never be consumed, and success would be a promise the emulator cannot keep.
 //!
 //! # What is not here, and why
 //!
@@ -205,6 +230,11 @@ typedef enum
     /// with a scheduler parks the caller when nothing is ready.
     HOS_SVC_WAIT_SYNCHRONIZATION = 0x18,
 
+    /// Cancels another thread's synchronization call, or arms its next one.
+    /// Answers success in `W0` either way; the cancelled wait is the call that sees
+    /// `0xEC01`. Needs a scheduler; refused without one.
+    HOS_SVC_CANCEL_SYNCHRONIZATION = 0x19,
+
     /// Answers the system tick counter.
     HOS_SVC_GET_SYSTEM_TICK = 0x1E,
 
@@ -227,6 +257,11 @@ typedef enum
     /// Discards a range of the data cache.
     HOS_SVC_FLUSH_DATA_CACHE = 0x2B,
 
+    /// Creates a manual-reset event and answers its two handles: `W1` is the writable
+    /// side and `W2` the readable one (the caller's stub stores those registers through
+    /// the two pointers it saved before the trap). Takes no arguments.
+    HOS_SVC_CREATE_EVENT = 0x45,
+
     /// Enters the system sleep state. Returns nothing; there is nothing to sleep.
     HOS_SVC_SLEEP_SYSTEM = 0x4D,
 } hos_svc_t;
@@ -248,6 +283,11 @@ typedef enum
 
 /// A wait finished without anything it was waiting for becoming ready.
 #define HOS_RESULT_TIMEOUT 0x0000EA01U
+
+/// A wait was interrupted by another thread's `svcCancelSynchronization`. Horizon's own
+/// name for this word is "Interrupted", and the wait reports no index: the call stopped
+/// without anything having become ready, so there is nothing for the index to name.
+#define HOS_RESULT_INTERRUPTED 0x0000EC01U
 
 /// More handles were passed to a wait than the kernel accepts.
 #define HOS_RESULT_TOO_MANY_HANDLES 0x0000EE01U
@@ -440,6 +480,10 @@ void hos_syscall_context_set_layout(hos_syscall_context_t *POUND_RESTRICT contex
 /// - `HOS_WAKE_TIMED_OUT` -- nothing was ready before the deadline. `X0` becomes
 ///   `HOS_RESULT_TIMEOUT`, and the pointer is not written: a timeout has no index to
 ///   report.
+/// - `HOS_WAKE_CANCELLED` -- another thread interrupted the wait with
+///   `svcCancelSynchronization`. `X0` becomes `HOS_RESULT_INTERRUPTED` (`0xEC01`), and the
+///   pointer is not written for the same reason a timeout does not write it: the call
+///   stopped without anything becoming ready, so it has no index to report.
 /// - `HOS_WAKE_SLEPT` -- a plain sleep ended. `svcSleepThread` returns nothing, so `X0`
 ///   is left exactly as the guest left it.
 ///
@@ -448,7 +492,7 @@ void hos_syscall_context_set_layout(hos_syscall_context_t *POUND_RESTRICT contex
 /// Why the wake reason is enough to know what to write, without the scheduler having to
 /// remember which call parked the thread: only `svcWaitSynchronization` ever parks with a
 /// deadline or on handles, and only `svcSleepThread` ever parks with nothing to wait on,
-/// so `HOS_WAKE_SLEPT` is a sleep and the other two are a wait. Keeping that mapping here
+/// so `HOS_WAKE_SLEPT` is a sleep and the others are a wait. Keeping that mapping here
 /// rather than in the scheduler is what lets the scheduler stay ignorant of system call
 /// registers.
 ///

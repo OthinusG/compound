@@ -230,12 +230,33 @@ thread. The `hos_kernel_thread_*` calls take identifiers and enforce no per-proc
 authority, because they are the emulator's own view of a thread rather than anything a
 guest can reach.
 
+A thread also carries one piece of pure request state: the cancellation flag that
+`svcCancelSynchronization` raises when the target is *not* in a synchronization call. It
+lives on the object, not in the scheduler, because it belongs to the thread rather than to
+the current wait — it survives until that thread synchronizes or dies, and it applies to a
+thread the scheduler has never admitted. It is a flag and not a counter, so two requests
+before the next wait interrupt one call, exactly as Horizon's `bool` does. The request that
+lands on a thread which *is* parked is the scheduler's to end, and is described there.
+
 A handle is `(generation << 20) | (index + 1)`, with zero reserved for "no object".
 Closing a handle frees its slot and advances the slot's generation, so a handle that
 outlived its object stops resolving instead of silently naming whatever lands in the
 slot next. Without that, a copied-around handle would eventually read another title's
 data through a name it thought it had given back — the worst kind of failure, because
 it is not a crash.
+
+Authority is part of the handle, not only of the object. Horizon creates an event as
+*two* handles — a writable one that signals it and a readable one that waits on or resets
+it — and answers the wrong side with `0xE401`, the same result as a handle that names
+nothing. A handle slot therefore stores a rights word (`HOS_HANDLE_RIGHT_READ`,
+`HOS_HANDLE_RIGHT_WRITE`) alongside its object index, and every event operation resolves
+the handle for the side it needs: `svcSignalEvent` writes, a wait reads, `svcResetSignal`
+reads and `svcClearEvent` accepts either, exactly as the wiki documents. The rights live on
+the handle rather than on the object, so `svcDuplicateHandle` copies them and can never
+promote a readable handle into a writable one. `hos_process_create_event` still mints the
+single both-rights handle the emulator's own callers need; the pair that `svcCreateEvent`
+returns comes from `hos_process_create_event_pair`, and if the second allocation fails the
+first is dropped rather than left in the table where no guest could name it.
 
 Objects, services, and every process's handle table share one kernel mutex. Splitting
 it would give handle operations a lock order the object path would have to take in
@@ -250,8 +271,10 @@ owns threads and never chooses between them. That is `hos/scheduler.{h,c}` below
 Shared-memory and port objects, and the Horizon IPC wire format, are out of scope and each
 is refused rather than half-handled. The module adds `POUND_ERROR_INVALID_HANDLE` for a
 handle that names nothing — always logged, unlike the `POUND_ERROR_NOT_FOUND` it sits
-beside, because a missing service is an ordinary answer and a missing object never is.
-`tests/test_hos_kernel.c` covers it with 40 cases.
+beside, because a missing service is an ordinary answer and a missing object never is —
+and `POUND_ERROR_INVALID_STATE` for an event that is not signalled when clear or reset
+needs it to be, which the syscall layer reports as Horizon's `0xFA01`.
+`tests/test_hos_kernel.c` covers it with 44 cases.
 
 ### Horizon OS scheduler — `src/core/hos/scheduler.{h,c}`
 
@@ -282,7 +305,16 @@ ready — a fact about the guest worth reporting) or `FINISHED` (no threads left
 The scheduler has no lock, and that is the concurrency model rather than an omission: one
 scheduler is one guest core driven by one host thread, and stepping it from two host threads
 at once is a caller's bug that a mutex here would not make correct.
-`tests/test_hos_scheduler.c` covers it with 22 cases.
+
+Cancellation is the one wake that does not come from the wait set. `hos_scheduler_cancel`
+finds a thread parked *on handles*, marks it runnable with a `HOS_WAKE_CANCELLED` wake and
+reports that it did so; the run loop answers that call with Horizon's `0xEC01` and reports no
+index. A thread that is running, runnable, sleeping or unknown is deliberately left alone and
+the caller is told so, which is what lets `svcCancelSynchronization` fall back to the
+kernel-side flag: Horizon interrupts a synchronization call that is in progress, and arms the
+next one otherwise, and those two cases are exactly "the scheduler had a wait to end" and "it
+did not". A sleep is not a synchronization call, so cancelling one changes nothing and its
+clock still ends it. `tests/test_hos_scheduler.c` covers it with 24 cases.
 
 ### Horizon OS memory layout — `src/core/hos/memory_layout.{h,c}`
 
@@ -368,7 +400,8 @@ and the emulator looks like firmware that replied. A refusal is a fact about Pou
 Switch system calls do not all answer in `X0`, and there are three places an answer can
 land. The `Result` is always `W0`. But an *output parameter* has two more homes: a
 **register** — `svcWaitSynchronization`'s ready index is `W1`, `svcSetHeapSize`'s heap base
-is `X1`, `svcGetThreadId`'s identifier is `X1` — and, for the calls where the *kernel*
+is `X1`, `svcGetThreadId`'s identifier is `X1`, and `svcCreateEvent` answers its writable
+handle in `W1` and its readable one in `W2` — and, for the calls where the *kernel*
 writes it, **through a pointer in `X0`**, as `svcQueryMemory`'s `MemoryInfo` is.
 
 The register is what actually reaches a real guest: the kernel leaves the value in `W1`,
@@ -382,6 +415,19 @@ gone. Where hardware's value in a register on a *failure* path is not establishe
 register is left as the guest left it rather than given an invented value. A call that
 returns nothing at all — `svcExitThread`, `svcSleepThread`, `svcFlushEntireDataCache` —
 leaves `X0` exactly as the guest left it.
+
+`svcCreateEvent` is the first call that answers in two registers, and it shows why the
+stub is part of the ABI. It takes no arguments; the kernel leaves the writable handle in
+`W1` and the readable one in `W2`, and libnx's stub stores both through the two pointers
+its caller saved before the trap. The event is manual-reset, not auto-reset, because libnx
+implements its autoclear mode by calling `svcResetSignal` after a successful wait — a
+kernel that consumed the signal in the wait would make every autoclear wait return
+`0xFA01`. Horizon's event handles are one-sided, so signalling the readable side, waiting
+on or resetting the writable side, and using either side of an object that is not an event
+are all `0xE401`; clearing an event that is already clear is `0xFA01` rather than a silent
+success, and that distinction is what lets a guest tell who consumed the signal. An event
+pair that cannot be allocated is `0xCE01`, the same `SlabExhausted` word Horizon uses for
+event quota exhaustion.
 
 Blocking is where a context with a scheduler and one without differ, deliberately. A call
 that can be satisfied now never parks a thread: `svcWaitSynchronization` and a positive
@@ -408,7 +454,9 @@ inventing one would look like an answer.
 
 A wait over several handles treats a session as a legitimate object that is simply never
 the ready one, rather than as an error: a title waiting on a session and an event at once
-is a normal shape for a main loop, and nothing queues a message in this slice. The
+is a normal shape for a main loop, and nothing queues a message in this slice. A writable
+event handle is refused as `0xE401` instead, because Horizon's wait takes readable objects
+and a wait that could never be satisfied is a guest bug rather than a quiet handle. The
 memory-layout calls that need an alias path (`svcMapMemory` and `svcUnmapMemory`), IPC, and
 the process queries are out of scope and refused by name.
 
@@ -435,6 +483,19 @@ changed") both collapse to the kernel's single `0xD401`, and whose table-full ex
 `0xCE01`. Because both calls write the same table `svcQueryMemory` reads, a change made by
 one is visible in the other.
 
+`svcCancelSynchronization` is the first call here whose *answer* lands on another thread.
+Horizon documents two cases and one result: a target already inside
+`svcWaitSynchronization` has that call interrupted, and a target that is not has its next
+synchronization call interrupted; either way the cancelled wait reports `0xEC01`, writes no
+index, and the cancelling call itself succeeds. The handler asks the scheduler to end a
+parked wait first and, only when there was none, raises the flag on the thread object, so the
+two cases are told apart by the layer that knows which one is true rather than guessed. A
+wait consumes a pending request before it looks at its handles, which is why a cancellation
+wins over a handle that was already ready and an auto-reset event is not consumed by a call
+that never polled. Without a scheduler the call is refused even though setting the flag
+needs no clock: the flag could never be consumed by a wait in that context, so answering
+success would promise an interruption the emulator cannot deliver.
+
 The module adds `POUND_ERROR_UNSUPPORTED_SYSCALL` for a well-formed `svc` whose number or
 feature the OS layer has not implemented — distinct from
 `POUND_ERROR_UNSUPPORTED_INSTRUCTION`, which is a fact about the decoder. The dispatch
@@ -442,7 +503,7 @@ context carries the kernel, the process, the guest memory, the caller's clock an
 number, and — through `hos_syscall_context_set_scheduler` and
 `hos_syscall_context_set_layout` — the scheduler that parks a blocked thread and the address
 space that answers the memory calls, rather than reading a global, so a test can drive any
-of them. `tests/test_hos_syscall.c` covers it with 41 cases.
+of them. `tests/test_hos_syscall.c` covers it with 46 cases.
 
 ---
 
